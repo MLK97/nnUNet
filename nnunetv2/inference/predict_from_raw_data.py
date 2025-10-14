@@ -208,6 +208,7 @@ class nnUNetPredictor(object):
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],
                            output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
                            save_probabilities: bool = False,
+                           uncertainty_type: str = 't',
                            overwrite: bool = True,
                            num_processes_preprocessing: int = default_num_processes,
                            num_processes_segmentation_export: int = default_num_processes,
@@ -892,6 +893,9 @@ def predict_entry_point():
     parser.add_argument('-f', nargs='+', type=str, required=False, default=(0, 1, 2, 3, 4),
                         help='Specify the folds of the trained model that should be used for prediction. '
                              'Default: (0, 1, 2, 3, 4)')
+    parser.add_argument('-u', type=str, required=False, default=None, help='Define if you want to generate uncertainty maps.'
+                             'Uncertainty maps are based on entropy and jensen-shannon divergence. Default: None. '
+                             'Options: t (total) or c (channelwise)')
     parser.add_argument('-step_size', type=float, required=False, default=0.5,
                         help='Step size for sliding window prediction. The larger it is the faster but less accurate '
                              'the prediction. Default: 0.5. Cannot be larger than 1. We recommend the default.')
@@ -937,10 +941,10 @@ def predict_entry_point():
         "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
         "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
         "Nature methods, 18(2), 203-211.\n#######################################################################\n")
-
+        
     args = parser.parse_args()
     args.f = [i if i == 'all' else int(i) for i in args.f]
-
+    print(args)
     model_folder = get_output_folder(args.d, args.tr, args.p, args.c)
 
     if not isdir(args.o):
@@ -963,20 +967,34 @@ def predict_entry_point():
         device = torch.device('cuda')
     else:
         device = torch.device('mps')
-
-    predictor = nnUNetPredictor(tile_step_size=args.step_size,
-                                use_gaussian=True,
-                                use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
-                                device=device,
-                                verbose=args.verbose,
-                                verbose_preprocessing=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar)
+	
+    if args.u == 't' or args.u == 'c':
+        from nnunetv2.inference.OUH_inference import UncertaintyPredictor
+        predictor = UncertaintyPredictor(uncertainty_type=args.u,
+                                    tile_step_size=args.step_size,
+	                            use_gaussian=True,
+	                            use_mirroring=not args.disable_tta,
+	                            perform_everything_on_device=True,
+	                            device=device,
+	                            verbose=args.verbose,
+	                            verbose_preprocessing=args.verbose,
+	                            allow_tqdm=not args.disable_progress_bar)
+    else:
+        predictor = nnUNetPredictor(tile_step_size=args.step_size,
+	                            use_gaussian=True,
+	                            use_mirroring=not args.disable_tta,
+	                            perform_everything_on_device=True,
+	                            device=device,
+	                            verbose=args.verbose,
+	                            verbose_preprocessing=args.verbose,
+	                            allow_tqdm=not args.disable_progress_bar)
+	                               
     predictor.initialize_from_trained_model_folder(
         model_folder,
         args.f,
         checkpoint_name=args.chk
     )
+    
     
     run_sequential = args.nps == 0 and args.npp == 0
     
