@@ -219,6 +219,29 @@ class LabelManager(object):
         probs_reverted_cropping = insert_crop_into_image(probs_reverted_cropping, predicted_probabilities, bbox)
         return probs_reverted_cropping
 
+    def revert_cropping_on_uncertainties(self, predicted_uncertainties: Union[torch.Tensor, np.ndarray],
+                                         bbox: List[List[int]],
+                                         original_shape: Union[List[int], Tuple[int, ...]]):
+        """
+        ONLY USE THIS WITH UNCERTAINTIES, DO NOT USE LOGITS OR SOFTMAX PROBABILITIES AND DO NOT USE FOR SEGMENTATION MAPS!!!
+
+        predicted_probabilities must be (c, x, y(, z))
+
+        This is a copy of revert_cropping_on_uncertainties, except that the padded area is set to 0 instead of 1. This is because
+        in general the padded area should have an uncertainty of 0 instead of 1.
+        """
+        # revert cropping
+        uncertain_reverted_cropping = np.zeros((predicted_uncertainties.shape[0], *original_shape),
+                                           dtype=predicted_probabilities.dtype) \
+            if isinstance(predicted_uncertainties, np.ndarray) else \
+            torch.zeros((predicted_uncertainties.shape[0], *original_shape), dtype=predicted_uncertainties.dtype)
+
+        if not self.has_regions:
+            uncertain_reverted_cropping[0] = 0
+
+        uncertain_reverted_cropping = insert_crop_into_image(uncertain_reverted_cropping, predicted_uncertainties, bbox)
+        return uncertain_reverted_cropping
+
     @staticmethod
     def filter_background(classes_or_regions: Union[List[int], List[Union[int, Tuple[int, ...]]]]):
         # heck yeah
