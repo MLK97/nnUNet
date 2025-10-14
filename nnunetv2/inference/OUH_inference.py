@@ -54,6 +54,7 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
                                                                 label_manager: LabelManager,
                                                                 properties_dict: dict,
                                                                 return_probabilities: bool = False,
+                                                                uncertainty_type: str = 't',
                                                                 num_threads_torch: int = default_num_processes):
     old_threads = torch.get_num_threads()
     torch.set_num_threads(num_threads_torch)
@@ -64,17 +65,12 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
         len(configuration_manager.spacing) == \
         len(properties_dict['shape_after_cropping_and_before_resampling']) else \
         [spacing_transposed[0], *configuration_manager.spacing]
-    # print('PREDICTED LOGITS FOLD')
-    # print(predicted_logits_fold.shape)
-    # print(type(predicted_logits_fold.shape))
+
     predicted_logits_fold = [configuration_manager.resampling_fn_probabilities(predicted_logits,
                                             properties_dict['shape_after_cropping_and_before_resampling'],
                                             current_spacing,
                                             [properties_dict['spacing'][i] for i in plans_manager.transpose_forward]) for predicted_logits in predicted_logits_fold]
-                                            
-    # print('PREDICTED LOGITS FOLD POST')
-    # print(len(predicted_logits_fold))
-    # print(type(predicted_logits_fold[0]))
+
     # return value of resampling_fn_probabilities can be ndarray or Tensor but that does not matter because
     # apply_inference_nonlin will convert to torch
     if not return_probabilities:
@@ -85,14 +81,30 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
         predicted_probabilities_folds = [label_manager.apply_inference_nonlin(predicted_logits) for predicted_logits in predicted_logits_fold]
         predicted_probabilities_folds = torch.stack(predicted_probabilities_folds, dim=0)
         predicted_probabilities = torch.mean(predicted_probabilities_folds, dim=0)
-        jsd, entropy_mean, mean_entropy = jensen_shannon_divergence_torch(predicted_probabilities_folds)
+        
+        if uncertainty_type == 't':
+            jsd, entropy_mean, mean_entropy = jensen_shannon_divergence_torch(predicted_probabilities_folds)
+        elif uncertainty_type == 'c':
+            uncertainty_output = [channelwise_jensen_shannon_divergence(predicted_probabilities_folds, roi_channel=n) for n in range(1,predicted_probabilities_folds.shape[1])]
+            # TODO: still need to make it loopy
+            jsd = uncertainty_output[1]['jsd_map']
+            entropy_mean = uncertainty_output[1]['entropy_mean']
+            mean_entropy = uncertainty_output[1]['mean_entropy']
+	
     else:
         predicted_logits = np.mean(predicted_logits_fold, axis=0)
         # now we need to normalize (softmax) the logits for the computation of the entropies
         predicted_probabilities_folds = [label_manager.apply_inference_nonlin(predicted_logits) for predicted_logits in predicted_logits_fold]
         predicted_probabilities_folds = torch.stack(predicted_probabilities_folds, dim=0)
-        
-        jsd, entropy_mean, mean_entropy = jensen_shannon_divergence_torch(predicted_probabilities_folds)
+        if uncertainty_type == 't':
+            jsd, entropy_mean, mean_entropy = jensen_shannon_divergence_torch(predicted_probabilities_folds)
+            uncertainty_output = None
+        elif uncertainty_type == 'c':
+            uncertainty_output = [channelwise_jensen_shannon_divergence(predicted_probabilities_folds, roi_channel=n) for n in range(1,predicted_probabilities_folds.shape[1])]
+            # TODO: still need to make it loopy
+            jsd = uncertainty_output[1]['jsd_mad']
+            entropy_mean = uncertainty_output[1]['entropy_mean']
+            mean_entropy = uncertainty_output[1]['mean_entropy']
         
         predicted_probabilities = label_manager.apply_inference_nonlin(predicted_logits)
         segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
@@ -123,6 +135,11 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
                                                          properties_dict['shape_before_cropping'])
     mean_entropy = mean_entropy.cpu().numpy()
     mean_entropy = mean_entropy.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
+    entropy_mean = label_manager.revert_cropping_on_uncertainties(entropy_mean,
+                                                         properties_dict['bbox_used_for_cropping'],
+                                                         properties_dict['shape_before_cropping'])
+    entropy_mean = entropy_mean.cpu().numpy()
+    entropy_mean = entropy_mean.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
     if return_probabilities:
         # revert cropping
         predicted_probabilities = label_manager.revert_cropping_on_probabilities(predicted_probabilities,
@@ -135,16 +152,17 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
         predicted_probabilities = predicted_probabilities.transpose([0] + [i + 1 for i in
                                                                            plans_manager.transpose_backward])
         torch.set_num_threads(old_threads)
-        return segmentation_reverted_cropping, predicted_probabilities, jsd, mean_entropy
+        return segmentation_reverted_cropping, predicted_probabilities, jsd, mean_entropy, entropy_mean
     else:
         torch.set_num_threads(old_threads)
-        return segmentation_reverted_cropping, jsd, mean_entropy
+        return segmentation_reverted_cropping, jsd, mean_entropy, entropy_mean
 
 def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, torch.Tensor], properties_dict: dict,
                                   configuration_manager: ConfigurationManager,
                                   plans_manager: PlansManager,
                                   dataset_json_dict_or_file: Union[dict, str], output_file_truncated: str,
                                   save_probabilities: bool = False,
+                                  uncertainty_type: str = 't',
                                   compute_entropy: bool = False,
                                   num_threads_torch: int = default_num_processes):
     # if isinstance(predicted_array_or_file, str):
@@ -161,30 +179,36 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
     label_manager = plans_manager.get_label_manager(dataset_json_dict_or_file)
     ret = convert_predicted_logits_fold_to_segmentation_with_correct_shape(
         predicted_array_or_file, plans_manager, configuration_manager, label_manager, properties_dict,
-        return_probabilities=save_probabilities, num_threads_torch=num_threads_torch
+        return_probabilities=save_probabilities,uncertainty_type=uncertainty_type,num_threads_torch=num_threads_torch
     )
     del predicted_array_or_file
     
     # save
     if save_probabilities:
-        segmentation_final, probabilities_final, jsd_final, mean_entropy_final = ret  
+        segmentation_final, probabilities_final, jsd_final, mean_entropy_final, entropy_mean_final = ret  
         np.savez_compressed(output_file_truncated + '.npz', probabilities=probabilities_final)
         save_pickle(properties_dict, output_file_truncated + '.pkl')
         del probabilities_final, ret
     else:
-        segmentation_final, jsd_final, mean_entropy_final = ret
+        segmentation_final, jsd_final, mean_entropy_final, entropy_mean_final = ret
         del ret
 
     rw = plans_manager.image_reader_writer_class()
-    
-    jsd_final = np.squeeze(jsd_final, axis=0)
-    mean_entropy_final = np.squeeze(mean_entropy_final, axis=0)
-    rw.write_seg(jsd_final, output_file_truncated + '_epistemic_uncertainty' + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)
-    rw.write_seg(mean_entropy_final, output_file_truncated + '_aleatoric_uncertainty' + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)
     rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
                  properties_dict)
+    
+    # Write uncertainties
+    # for i, x in enumerate(a if isinstance(a, (list, tuple, set)) else [a]):
+ 
+    jsd_final = np.squeeze(jsd_final, axis=0)
+    mean_entropy_final = np.squeeze(mean_entropy_final, axis=0)
+    entropy_mean_final = np.squeeze(entropy_mean_final, axis=0)
+    rw.write_uncertainty(jsd_final, output_file_truncated + '_epistemic_uncertainty' + dataset_json_dict_or_file['file_ending'],
+                 properties_dict)
+    rw.write_uncertainty(mean_entropy_final, output_file_truncated + '_aleatoric_uncertainty' + dataset_json_dict_or_file['file_ending'],
+                 properties_dict)
+    rw.write_uncertainty(entropy_mean_final, output_file_truncated + '_total_uncertainty' + dataset_json_dict_or_file['file_ending'],
+                 properties_dict)                 
 
 
 def entropy_torch(p: torch.Tensor, dim: int = 1, eps: float = 1e-12) -> torch.Tensor:
@@ -216,7 +240,7 @@ def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor) -> torch.Tensor
     Returns:
         torch.Tensor: Jensen–Shannon divergence map of shape (Z, X, Y)
     """
-    print('starting uncertainty calculation')
+    print('starting total uncertainty calculation')
     # Mean probability across folds: (C, Z, X, Y)
     mean_probs = softmax_folds.mean(dim=0)
 
@@ -242,8 +266,80 @@ def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor) -> torch.Tensor
 
     return jsd, entropy_mean, mean_entropy
 
+def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, roi_channel: int, n_folds: int = 5):
+    """
+    Compute voxelwise Jensen-Shannon Divergence (JSD) map for an ROI vs all other classes,
+    across multiple softmax predictions.
+
+    Args:
+        softmax_probabilities: dict mapping 'fold_i' -> (C, H, W, D) softmax prediction
+        roi_channel: int, index of ROI channel
+        n_folds: number of folds (default 5)
+
+    Returns:
+        JSD map of shape (H, W, D)
+    """
+    print(f'starting channelwise uncertainty calculation for channel {roi_channel}')
+    # Collapse to ROI vs others: (F, 2, H, W, D)
+    roi_probs = softmax_probabilities[:, roi_channel, ...]  # (F, H, W, D)
+    other_probs = softmax_probabilities.sum(dim=1) - roi_probs
+    softmax_probabilities_collapsed = torch.stack([roi_probs, other_probs], dim=1)  # (F, 2, H, W, D)
+
+    # Renormalize to ensure valid probabilities
+    softmax_probabilities_collapsed /= softmax_probabilities_collapsed.sum(dim=1, keepdim=True)
+
+    # Mean distribution across folds: (2, H, W, D)
+    mean_softmax_collapsed = softmax_probabilities_collapsed.mean(dim=0)
+
+    # Entropy of mean distribution
+    entropy_mean = entropy_torch(mean_softmax_collapsed, dim=0)  # (H, W, D)
+
+    # Mean entropy across folds
+    entropy_folds = entropy_torch(softmax_probabilities_collapsed, dim=1)  # (F, H, W, D)
+    mean_entropy = entropy_folds.mean(dim=0)  # (H, W, D)
+    
+    # Need to add a dimension for cropping later on
+    entropy_mean = entropy_mean.unsqueeze(0)
+    mean_entropy = mean_entropy.unsqueeze(0)
+   
+    jsd_map = entropy_mean - mean_entropy
+
+    return {
+        'jsd_map': jsd_map,
+        'entropy_mean': entropy_mean,
+        'mean_entropy': mean_entropy
+    }
 
 class UncertaintyPredictor(nnUNetPredictor):
+    def __init__(self,
+                 uncertainty_type: str = 't',
+                 tile_step_size: float = 0.5,
+                 use_gaussian: bool = True,
+                 use_mirroring: bool = True,
+                 perform_everything_on_device: bool = True,
+                 device: torch.device = torch.device('cuda'),
+                 verbose: bool = False,
+                 verbose_preprocessing: bool = False,
+                 allow_tqdm: bool = True):
+        self.uncertainty_type = uncertainty_type
+        self.verbose = verbose
+        self.verbose_preprocessing = verbose_preprocessing
+        self.allow_tqdm = allow_tqdm
+
+        self.plans_manager, self.configuration_manager, self.list_of_parameters, self.network, self.dataset_json, \
+        self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
+
+        self.tile_step_size = tile_step_size
+        self.use_gaussian = use_gaussian
+        self.use_mirroring = use_mirroring
+        if device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+        else:
+            print(f'perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
+            perform_everything_on_device = False
+        self.device = device
+        self.perform_everything_on_device = perform_everything_on_device
+        
     @torch.inference_mode()
     def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
         """
@@ -255,7 +351,6 @@ class UncertaintyPredictor(nnUNetPredictor):
         """
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
-        # prediction = None
         prediction = []
 
         for fold_idx, params in enumerate(self.list_of_parameters):
@@ -271,8 +366,6 @@ class UncertaintyPredictor(nnUNetPredictor):
             # this actually saves computation time
             pred = self.predict_sliding_window_return_logits(data).to('cpu')
             prediction.append(pred)
-            
-        # print(type(pred))
 	
         if len(self.list_of_parameters) > 1:
             # we average over the different folds in logit space, just
@@ -280,10 +373,6 @@ class UncertaintyPredictor(nnUNetPredictor):
             fold_pred_tensor = torch.stack(prediction, dim=0)
             prediction = torch.mean(fold_pred_tensor, dim=0)
             # prediction /= len(self.list_of_parameters) # this is the standard nnU-Net implementation
-            
-        # print('IS HE SOFTMAXXING?')
-        # print(torch.max(prediction))
-        # print(torch.min(prediction))
 
         if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
@@ -336,7 +425,7 @@ class UncertaintyPredictor(nnUNetPredictor):
                         export_pool.starmap_async(
                             export_prediction_from_logits,
                             ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                              self.dataset_json, ofile, save_probabilities, self.uncertainty_type),)
                         )
                     )
                 else:
@@ -347,7 +436,7 @@ class UncertaintyPredictor(nnUNetPredictor):
                                 (prediction, self.plans_manager,
                                  self.configuration_manager, self.label_manager,
                                  properties,
-                                 save_probabilities),)
+                                 save_probabilities, self.uncertainty_type),)
                         )
                     )
                 if ofile is not None:
