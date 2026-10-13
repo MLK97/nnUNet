@@ -2,6 +2,7 @@ import inspect
 import itertools
 import multiprocessing
 import os
+from pathlib import Path
 from copy import deepcopy
 from queue import Queue
 from threading import Thread
@@ -86,10 +87,9 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
             jsd, entropy_mean, mean_entropy = jensen_shannon_divergence_torch(predicted_probabilities_folds)
         elif uncertainty_type == 'c':
             uncertainty_output = [channelwise_jensen_shannon_divergence(predicted_probabilities_folds, roi_channel=n) for n in range(1,predicted_probabilities_folds.shape[1])]
-            # TODO: still need to make it loopy
-            jsd = uncertainty_output[1]['jsd_map']
-            entropy_mean = uncertainty_output[1]['entropy_mean']
-            mean_entropy = uncertainty_output[1]['mean_entropy']
+            jsd = [unc['jsd_map'] for unc in uncertainty_output]
+            entropy_mean = [unc['entropy_mean'] for unc in uncertainty_output]
+            mean_entropy = [unc['mean_entropy'] for unc in uncertainty_output]
 	
     else:
         predicted_logits = np.mean(predicted_logits_fold, axis=0)
@@ -101,10 +101,9 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
             uncertainty_output = None
         elif uncertainty_type == 'c':
             uncertainty_output = [channelwise_jensen_shannon_divergence(predicted_probabilities_folds, roi_channel=n) for n in range(1,predicted_probabilities_folds.shape[1])]
-            # TODO: still need to make it loopy
-            jsd = uncertainty_output[1]['jsd_mad']
-            entropy_mean = uncertainty_output[1]['entropy_mean']
-            mean_entropy = uncertainty_output[1]['mean_entropy']
+            jsd = [unc['jsd_map'] for unc in uncertainty_output]
+            entropy_mean = [unc['entropy_mean'] for unc in uncertainty_output]
+            mean_entropy = [unc['mean_entropy'] for unc in uncertainty_output]
         
         predicted_probabilities = label_manager.apply_inference_nonlin(predicted_logits)
         segmentation = label_manager.convert_probabilities_to_segmentation(predicted_probabilities)
@@ -124,22 +123,10 @@ def convert_predicted_logits_fold_to_segmentation_with_correct_shape(predicted_l
     # revert transpose
     segmentation_reverted_cropping = segmentation_reverted_cropping.transpose(plans_manager.transpose_backward)
     # revert cropping and transposition of uncertainty masks
-    jsd = label_manager.revert_cropping_on_uncertainties(jsd,
-                                                         properties_dict['bbox_used_for_cropping'],
-                                                         properties_dict['shape_before_cropping'])
-    jsd = jsd.cpu().numpy()
-    
-    jsd = jsd.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
-    mean_entropy = label_manager.revert_cropping_on_uncertainties(mean_entropy,
-                                                         properties_dict['bbox_used_for_cropping'],
-                                                         properties_dict['shape_before_cropping'])
-    mean_entropy = mean_entropy.cpu().numpy()
-    mean_entropy = mean_entropy.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
-    entropy_mean = label_manager.revert_cropping_on_uncertainties(entropy_mean,
-                                                         properties_dict['bbox_used_for_cropping'],
-                                                         properties_dict['shape_before_cropping'])
-    entropy_mean = entropy_mean.cpu().numpy()
-    entropy_mean = entropy_mean.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
+    jsd = maybe_list_apply(lambda x: process_tensor(x, label_manager, properties_dict, plans_manager), jsd)
+    mean_entropy = maybe_list_apply(lambda x: process_tensor(x, label_manager, properties_dict, plans_manager), mean_entropy)
+    entropy_mean = maybe_list_apply(lambda x: process_tensor(x, label_manager, properties_dict, plans_manager), entropy_mean)
+            
     if return_probabilities:
         # revert cropping
         predicted_probabilities = label_manager.revert_cropping_on_probabilities(predicted_probabilities,
@@ -197,18 +184,42 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
     rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
                  properties_dict)
     
-    # Write uncertainties
-    # for i, x in enumerate(a if isinstance(a, (list, tuple, set)) else [a]):
- 
-    jsd_final = np.squeeze(jsd_final, axis=0)
-    mean_entropy_final = np.squeeze(mean_entropy_final, axis=0)
-    entropy_mean_final = np.squeeze(entropy_mean_final, axis=0)
-    rw.write_uncertainty(jsd_final, output_file_truncated + '_epistemic_uncertainty' + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)
-    rw.write_uncertainty(mean_entropy_final, output_file_truncated + '_aleatoric_uncertainty' + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)
-    rw.write_uncertainty(entropy_mean_final, output_file_truncated + '_total_uncertainty' + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)                 
+    # Write uncertainties  
+    path = Path(output_file_truncated)
+    if isinstance(jsd_final, list):
+        os.makedirs(path.parent / "channelwise_uncertainty", exist_ok=True)
+        uncertainty_path = str(path.parent / "channelwise_uncertainty" / path.name)
+    else:
+        jsd_final = [jsd_final]
+        mean_entropy_final = [mean_entropy_final]
+        entropy_mean_final = [entropy_mean_final]
+        uncertainty_path = str(path.parent / path.name)
+
+    for i, (jsd, mean_entropy, entropy_mean) in enumerate(zip(jsd_final, mean_entropy_final, entropy_mean_final)):
+        jsd = np.squeeze(jsd, axis=0)
+        mean_entropy = np.squeeze(mean_entropy, axis=0)
+        entropy_mean = np.squeeze(entropy_mean, axis=0)
+        # i+1 to keep track of the channels and we don't want people to think we calculate uncertainties of the background channel
+        rw.write_uncertainty(jsd, uncertainty_path + f'_{i+1}_epistemic_uncertainty' + dataset_json_dict_or_file['file_ending'],
+                     properties_dict)
+        rw.write_uncertainty(mean_entropy, uncertainty_path + f'_{i+1}_aleatoric_uncertainty' + dataset_json_dict_or_file['file_ending'],
+                     properties_dict)
+        rw.write_uncertainty(entropy_mean, uncertainty_path + f'_{i+1}_total_uncertainty' + dataset_json_dict_or_file['file_ending'],
+                     properties_dict)     
+                 
+def process_tensor(unc_map, label_manager, properties_dict, plans_manager):
+    """Apply cropping revert, move to CPU numpy, and transpose."""
+    unc_map = label_manager.revert_cropping_on_uncertainties(
+        unc_map,
+        properties_dict['bbox_used_for_cropping'],
+        properties_dict['shape_before_cropping']
+    )
+    unc_map = unc_map.cpu().numpy()
+    unc_map = unc_map.transpose([0] + [i + 1 for i in plans_manager.transpose_backward])
+    return unc_map
+    
+def maybe_list_apply(func, unc_map):
+    return [func(i) for i in unc_map] if isinstance(unc_map, list) else func(unc_map)            
 
 
 def entropy_torch(p: torch.Tensor, dim: int = 1, eps: float = 1e-12) -> torch.Tensor:
@@ -227,7 +238,7 @@ def entropy_torch(p: torch.Tensor, dim: int = 1, eps: float = 1e-12) -> torch.Te
     return -(p * torch.log2(p)).sum(dim=dim)
 
 
-def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor) -> torch.Tensor:
+def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor, verbose=False) -> torch.Tensor:
     """
     Compute voxel-wise Jensen–Shannon divergence for an ensemble of softmax outputs.
 
@@ -240,7 +251,8 @@ def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor) -> torch.Tensor
     Returns:
         torch.Tensor: Jensen–Shannon divergence map of shape (Z, X, Y)
     """
-    print('starting total uncertainty calculation')
+    if verbose:
+        print('total uncertainty calculation')
     # Mean probability across folds: (C, Z, X, Y)
     mean_probs = softmax_folds.mean(dim=0)
 
@@ -266,7 +278,7 @@ def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor) -> torch.Tensor
 
     return jsd, entropy_mean, mean_entropy
 
-def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, roi_channel: int, n_folds: int = 5):
+def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, roi_channel: int, n_folds: int = 1, verbose=False):
     """
     Compute voxelwise Jensen-Shannon Divergence (JSD) map for an ROI vs all other classes,
     across multiple softmax predictions.
@@ -279,7 +291,8 @@ def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, r
     Returns:
         JSD map of shape (H, W, D)
     """
-    print(f'starting channelwise uncertainty calculation for channel {roi_channel}')
+    if verbose:
+        print(f'channelwise uncertainty calculation (channel {roi_channel})')
     # Collapse to ROI vs others: (F, 2, H, W, D)
     roi_probs = softmax_probabilities[:, roi_channel, ...]  # (F, H, W, D)
     other_probs = softmax_probabilities.sum(dim=1) - roi_probs
@@ -421,6 +434,10 @@ class UncertaintyPredictor(nnUNetPredictor):
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
+                    if self.uncertainty_type == 't':
+                        print('sending off logits for total uncertainty calculation')
+                    elif self.uncertainty_type == 'c':
+                        print('sending off logits for channelwise uncertainty calculation')
                     r.append(
                         export_pool.starmap_async(
                             export_prediction_from_logits,
@@ -430,6 +447,10 @@ class UncertaintyPredictor(nnUNetPredictor):
                     )
                 else:
                     print('sending off prediction to background worker for resampling')
+                    if self.uncertainty_type == 't':
+                        print('sending off logits for total uncertainty prediction')
+                    elif self.uncertainty_type == 'c':
+                        print('sending off logits for channelwise uncertainty calculation')
                     r.append(
                         export_pool.starmap_async(
                             convert_predicted_logits_fold_to_segmentation_with_correct_shape, (

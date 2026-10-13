@@ -944,7 +944,6 @@ def predict_entry_point():
         
     args = parser.parse_args()
     args.f = [i if i == 'all' else int(i) for i in args.f]
-    print(args)
     model_folder = get_output_folder(args.d, args.tr, args.p, args.c)
 
     if not isdir(args.o):

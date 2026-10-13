@@ -127,6 +127,20 @@ class SimpleITKIO(BaseReaderWriter):
         itk_image.SetDirection(properties['sitk_stuff']['direction'])
 
         sitk.WriteImage(itk_image, output_fname, True)
+        
+    def write_uncertainty(self, seg: np.ndarray, output_fname: str, properties: dict) -> None:
+        assert seg.ndim == 3, 'segmentation must be 3d. If you are exporting a 2d segmentation, please provide it as shape 1,x,y'
+        output_dimension = len(properties['sitk_stuff']['spacing'])
+        assert 1 < output_dimension < 4
+        if output_dimension == 2:
+            seg = seg[0]
+
+        itk_image = sitk.GetImageFromArray(seg.astype(np.float32, copy=False))
+        itk_image.SetSpacing(properties['sitk_stuff']['spacing'])
+        itk_image.SetOrigin(properties['sitk_stuff']['origin'])
+        itk_image.SetDirection(properties['sitk_stuff']['direction'])
+
+        sitk.WriteImage(itk_image, output_fname, True)
 
 
 class SimpleITKIOWithReorient(SimpleITKIO):

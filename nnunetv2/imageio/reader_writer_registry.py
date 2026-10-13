@@ -23,6 +23,7 @@ LIST_OF_IO_CLASSES = [
 def determine_reader_writer_from_dataset_json(dataset_json_content: dict, example_file: str = None,
                                               allow_nonmatching_filename: bool = False, verbose: bool = True
                                               ) -> Type[BaseReaderWriter]:
+                                              
     if 'overwrite_image_reader_writer' in dataset_json_content.keys() and \
             dataset_json_content['overwrite_image_reader_writer'] != 'None':
         ioclass_name = dataset_json_content['overwrite_image_reader_writer']
