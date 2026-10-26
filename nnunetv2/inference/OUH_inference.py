@@ -222,7 +222,7 @@ def maybe_list_apply(func, unc_map):
     return [func(i) for i in unc_map] if isinstance(unc_map, list) else func(unc_map)            
 
 
-def entropy_torch(p: torch.Tensor, dim: int = 1, eps: float = 1e-12) -> torch.Tensor:
+def entropy_torch(p: torch.Tensor, dim: int = 1, eps: float = 1e-7, high_precision: bool = True) -> torch.Tensor:
     """
     Compute entropy along `dim` using base-2 logarithm.
     
@@ -234,11 +234,17 @@ def entropy_torch(p: torch.Tensor, dim: int = 1, eps: float = 1e-12) -> torch.Te
     Returns:
         torch.Tensor: Entropy values with `dim` reduced
     """
-    p = torch.clamp(p, eps, 1.0)
-    return -(p * torch.log2(p)).sum(dim=dim)
+    if high_precision:
+        torch.set_default_dtype(torch.float32)
+        p.to(torch.float64)
+
+    log_p = torch.zeros_like(p)
+    mask = p > 0
+    log_p[mask] = torch.log2(p[mask])
+    return -(p * log_p).sum(dim=dim)
 
 
-def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor, verbose=False) -> torch.Tensor:
+def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor, high_precision: bool = True, verbose: bool = False) -> torch.Tensor:
     """
     Compute voxel-wise Jensen–Shannon divergence for an ensemble of softmax outputs.
 
@@ -253,6 +259,10 @@ def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor, verbose=False) 
     """
     if verbose:
         print('total uncertainty calculation')
+
+    if high_precision:
+        torch.set_default_dtype(torch.float64)
+        softmax_folds = softmax_folds.to(torch.float64)
     # Mean probability across folds: (C, Z, X, Y)
     mean_probs = softmax_folds.mean(dim=0)
 
@@ -276,9 +286,13 @@ def jensen_shannon_divergence_torch(softmax_folds: torch.Tensor, verbose=False) 
     # print(f'jsd {torch.mean(jsd)}, {torch.unique(jsd)}')
     # print(f'mean_entropy {torch.mean(mean_entropy)}, {torch.unique(mean_entropy)}')
 
-    return jsd, entropy_mean, mean_entropy
+    return {
+        'jsd_map': jsd,
+        'entropy_mean': entropy_mean,
+        'mean_entropy': mean_entropy
+    }
 
-def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, roi_channel: int, n_folds: int = 1, verbose=False):
+def channelwise_jensen_shannon_divergence(softmax_folds: torch.Tensor, roi_channel: int, n_folds: int = 1, high_precision: bool = True, verbose: bool = False) -> torch.Tensor:
     """
     Compute voxelwise Jensen-Shannon Divergence (JSD) map for an ROI vs all other classes,
     across multiple softmax predictions.
@@ -293,9 +307,14 @@ def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, r
     """
     if verbose:
         print(f'channelwise uncertainty calculation (channel {roi_channel})')
+
+    if high_precision:
+        torch.set_default_dtype(torch.float64)
+        softmax_folds = softmax_folds.to(torch.float64)
+
     # Collapse to ROI vs others: (F, 2, H, W, D)
-    roi_probs = softmax_probabilities[:, roi_channel, ...]  # (F, H, W, D)
-    other_probs = softmax_probabilities.sum(dim=1) - roi_probs
+    roi_probs = softmax_folds[:, roi_channel, ...]  # (F, H, W, D)
+    other_probs = softmax_folds.sum(dim=1) - roi_probs
     softmax_probabilities_collapsed = torch.stack([roi_probs, other_probs], dim=1)  # (F, 2, H, W, D)
 
     # Renormalize to ensure valid probabilities
@@ -315,10 +334,10 @@ def channelwise_jensen_shannon_divergence(softmax_probabilities: torch.Tensor, r
     entropy_mean = entropy_mean.unsqueeze(0)
     mean_entropy = mean_entropy.unsqueeze(0)
    
-    jsd_map = entropy_mean - mean_entropy
+    jsd = entropy_mean - mean_entropy
 
     return {
-        'jsd_map': jsd_map,
+        'jsd_map': jsd,
         'entropy_mean': entropy_mean,
         'mean_entropy': mean_entropy
     }
